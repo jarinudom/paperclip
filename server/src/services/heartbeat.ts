@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType } from "@paperclipai/shared";
 import {
@@ -218,6 +218,16 @@ type SessionCompactionDecision = {
   handoffMarkdown: string | null;
   previousRunId: string | null;
 };
+
+type IssueExecutionRepairReason =
+  | "missing_run"
+  | "inactive_run"
+  | "issue_not_in_progress"
+  | "issue_missing_assignee"
+  | "issue_assignee_mismatch"
+  | "queued_run_agent_unavailable"
+  | "queued_run_wakeup_missing"
+  | "queued_run_wakeup_inactive";
 
 interface ParsedIssueAssigneeAdapterOverrides {
   adapterConfig: Record<string, unknown> | null;
@@ -607,6 +617,90 @@ function normalizeAgentNameKey(value: string | null | undefined) {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
   return normalized.length > 0 ? normalized : null;
+}
+
+export function getIssueExecutionRepairReason(input: {
+  issueStatus: string;
+  assigneeAgentId: string | null;
+  runId: string | null;
+  runStatus: string | null;
+  runAgentId: string | null;
+  runCreatedAt: Date | null;
+  runUpdatedAt: Date | null;
+  wakeupRequestId: string | null;
+  wakeupRequestStatus: string | null;
+  agentStatus: string | null;
+  staleThresholdMs: number;
+  now: Date;
+}): IssueExecutionRepairReason | null {
+  if (!input.runId) return "missing_run";
+  if (input.runStatus !== "queued" && input.runStatus !== "running") return "inactive_run";
+  if (input.issueStatus === "done" || input.issueStatus === "cancelled") return "issue_not_in_progress";
+  if (!input.assigneeAgentId) return "issue_missing_assignee";
+  if (input.runAgentId && input.assigneeAgentId !== input.runAgentId) return "issue_assignee_mismatch";
+  if (input.runStatus !== "queued") return null;
+  if (input.staleThresholdMs <= 0) return null;
+
+  const referenceTime = input.runUpdatedAt ?? input.runCreatedAt;
+  if (!referenceTime) return null;
+  if (input.now.getTime() - referenceTime.getTime() < input.staleThresholdMs) return null;
+  if (
+    !input.agentStatus ||
+    input.agentStatus === "paused" ||
+    input.agentStatus === "terminated" ||
+    input.agentStatus === "pending_approval"
+  ) {
+    return "queued_run_agent_unavailable";
+  }
+  if (input.wakeupRequestId && !input.wakeupRequestStatus) return "queued_run_wakeup_missing";
+  if (input.wakeupRequestStatus && input.wakeupRequestStatus !== "queued") {
+    return "queued_run_wakeup_inactive";
+  }
+  return null;
+}
+
+function isTerminalIssueStatus(status: string | null | undefined): boolean {
+  return status === "done" || status === "cancelled";
+}
+
+export function shouldSkipIssueWakeupForStatus(input: {
+  issueStatus: string | null | undefined;
+  reason: string | null | undefined;
+  wakeReason?: string | null | undefined;
+}): boolean {
+  if (!isTerminalIssueStatus(input.issueStatus)) return false;
+  const effectiveReason = readNonEmptyString(input.reason) ?? readNonEmptyString(input.wakeReason);
+  if (!effectiveReason) return false;
+  if (effectiveReason === "issue_reopened_via_comment") return false;
+  return (
+    effectiveReason === "issue_assigned" ||
+    effectiveReason === "issue_status_changed" ||
+    effectiveReason === "issue_commented" ||
+    effectiveReason === "issue_comment_mentioned" ||
+    effectiveReason === "issue_execution_deferred" ||
+    effectiveReason === "issue_execution_promoted"
+  );
+}
+
+function describeIssueExecutionRepairReason(reason: IssueExecutionRepairReason): string {
+  switch (reason) {
+    case "missing_run":
+      return "Cleared stale issue execution lock because the referenced run no longer exists";
+    case "inactive_run":
+      return "Cleared stale issue execution lock because the referenced run is no longer active";
+    case "issue_not_in_progress":
+      return "Cancelled run because the issue is no longer in progress";
+    case "issue_missing_assignee":
+      return "Cancelled run because the issue no longer has an assignee";
+    case "issue_assignee_mismatch":
+      return "Cancelled run because the issue assignee no longer matches the active run";
+    case "queued_run_agent_unavailable":
+      return "Cancelled queued run because its agent is not invokable";
+    case "queued_run_wakeup_missing":
+      return "Cancelled queued run because its wakeup request is missing";
+    case "queued_run_wakeup_inactive":
+      return "Cancelled queued run because its wakeup request is no longer queued";
+  }
 }
 
 const defaultSessionCodec: AdapterSessionCodec = {
@@ -2441,22 +2535,54 @@ export function heartbeatService(db: Db) {
         }
   }
 
-  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+  async function releaseIssueExecutionLockAndPromote(input: {
+    companyId: string;
+    issueId: string;
+    expectedExecutionRunId?: string | null;
+  }) {
     const promotedRun = await db.transaction(async (tx) => {
       await tx.execute(
-        sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
+        sql`select id from issues where company_id = ${input.companyId} and id = ${input.issueId} for update`,
       );
 
       const issue = await tx
         .select({
           id: issues.id,
           companyId: issues.companyId,
+          status: issues.status,
         })
         .from(issues)
-        .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
+        .where(
+          and(
+            eq(issues.companyId, input.companyId),
+            eq(issues.id, input.issueId),
+            input.expectedExecutionRunId == null
+              ? sql`true`
+              : eq(issues.executionRunId, input.expectedExecutionRunId),
+          ),
+        )
         .then((rows) => rows[0] ?? null);
 
       if (!issue) return;
+
+      if (shouldSkipIssueWakeupForStatus({ issueStatus: issue.status, reason: "issue_execution_promoted" })) {
+        await tx
+          .update(agentWakeupRequests)
+          .set({
+            status: "skipped",
+            finishedAt: new Date(),
+            error: "Deferred wake skipped because the issue is no longer in progress",
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+              sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+            ),
+          );
+        return null;
+      }
 
       await tx
         .update(issues)
@@ -2593,6 +2719,96 @@ export function heartbeatService(db: Db) {
     await startNextQueuedRunForAgent(promotedRun.agentId);
   }
 
+  async function releaseIssueExecutionAndPromote(run: typeof heartbeatRuns.$inferSelect) {
+    const issue = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.executionRunId, run.id)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!issue) return;
+
+    await releaseIssueExecutionLockAndPromote({
+      companyId: run.companyId,
+      issueId: issue.id,
+      expectedExecutionRunId: run.id,
+    });
+  }
+
+  async function repairIssueExecutionLocks(opts?: { staleThresholdMs?: number }) {
+    const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const now = new Date();
+    const lockedIssues = await db
+      .select({
+        issueId: issues.id,
+        companyId: issues.companyId,
+        issueStatus: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        executionRunId: issues.executionRunId,
+        runId: heartbeatRuns.id,
+        runStatus: heartbeatRuns.status,
+        runAgentId: heartbeatRuns.agentId,
+        runCreatedAt: heartbeatRuns.createdAt,
+        runUpdatedAt: heartbeatRuns.updatedAt,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        wakeupRequestStatus: agentWakeupRequests.status,
+        agentStatus: agents.status,
+      })
+      .from(issues)
+      .leftJoin(heartbeatRuns, eq(heartbeatRuns.id, issues.executionRunId))
+      .leftJoin(agentWakeupRequests, eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId))
+      .leftJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(isNotNull(issues.executionRunId));
+
+    const repaired: Array<{ issueId: string; runId: string | null; reason: IssueExecutionRepairReason }> = [];
+
+    for (const lockedIssue of lockedIssues) {
+      const reason = getIssueExecutionRepairReason({
+        issueStatus: lockedIssue.issueStatus,
+        assigneeAgentId: lockedIssue.assigneeAgentId,
+        runId: lockedIssue.runId,
+        runStatus: lockedIssue.runStatus,
+        runAgentId: lockedIssue.runAgentId,
+        runCreatedAt: lockedIssue.runCreatedAt,
+        runUpdatedAt: lockedIssue.runUpdatedAt,
+        wakeupRequestId: lockedIssue.wakeupRequestId,
+        wakeupRequestStatus: lockedIssue.wakeupRequestStatus,
+        agentStatus: lockedIssue.agentStatus,
+        staleThresholdMs,
+        now,
+      });
+      if (!reason) continue;
+
+      if (lockedIssue.runId && (lockedIssue.runStatus === "queued" || lockedIssue.runStatus === "running")) {
+        await cancelRunInternal(lockedIssue.runId, describeIssueExecutionRepairReason(reason));
+      } else {
+        await releaseIssueExecutionLockAndPromote({
+          companyId: lockedIssue.companyId,
+          issueId: lockedIssue.issueId,
+          expectedExecutionRunId: lockedIssue.executionRunId,
+        });
+      }
+
+      repaired.push({
+        issueId: lockedIssue.issueId,
+        runId: lockedIssue.runId ?? lockedIssue.executionRunId,
+        reason,
+      });
+    }
+
+    if (repaired.length > 0) {
+      logger.warn(
+        {
+          repairedCount: repaired.length,
+          repairs: repaired,
+        },
+        "repaired stale issue execution locks",
+      );
+    }
+
+    return { repaired: repaired.length, repairs: repaired };
+  }
+
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}) {
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
@@ -2632,13 +2848,27 @@ export function heartbeatService(db: Db) {
       });
     };
 
+    let issueSnapshot: { projectId: string | null; status: string } | null = null;
     let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
-    if (!projectId && issueId) {
-      projectId = await db
-        .select({ projectId: issues.projectId })
+    if (issueId) {
+      issueSnapshot = await db
+        .select({ projectId: issues.projectId, status: issues.status })
         .from(issues)
         .where(and(eq(issues.id, issueId), eq(issues.companyId, agent.companyId)))
-        .then((rows) => rows[0]?.projectId ?? null);
+        .then((rows) => rows[0] ?? null);
+      if (!projectId) {
+        projectId = issueSnapshot?.projectId ?? null;
+      }
+      if (
+        shouldSkipIssueWakeupForStatus({
+          issueStatus: issueSnapshot?.status ?? null,
+          reason,
+          wakeReason: readNonEmptyString(enrichedContextSnapshot.wakeReason),
+        })
+      ) {
+        await writeSkippedRequest("issue_execution_issue_not_in_progress");
+        return null;
+      }
     }
 
     const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agentId, {
@@ -3402,6 +3632,8 @@ export function heartbeatService(db: Db) {
       }),
 
     wakeup: enqueueWakeup,
+
+    repairIssueExecutionLocks,
 
     reapOrphanedRuns,
 

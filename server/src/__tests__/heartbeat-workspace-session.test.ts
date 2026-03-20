@@ -3,10 +3,12 @@ import type { agents } from "@paperclipai/db";
 import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 import {
   formatRuntimeWorkspaceWarningLog,
+  getIssueExecutionRepairReason,
   prioritizeProjectWorkspaceCandidatesForRun,
   parseSessionCompactionPolicy,
   resolveRuntimeSessionParamsForWorkspace,
   shouldResetTaskSessionForWake,
+  shouldSkipIssueWakeupForStatus,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
 
@@ -276,5 +278,112 @@ describe("parseSessionCompactionPolicy", () => {
       maxRawInputTokens: 500_000,
       maxSessionAgeHours: 0,
     });
+  });
+});
+
+describe("getIssueExecutionRepairReason", () => {
+  it("repairs locks when the issue is terminal", () => {
+    expect(
+      getIssueExecutionRepairReason({
+        issueStatus: "done",
+        assigneeAgentId: "agent-1",
+        runId: "run-1",
+        runStatus: "queued",
+        runAgentId: "agent-1",
+        runCreatedAt: new Date("2026-03-20T00:00:00Z"),
+        runUpdatedAt: new Date("2026-03-20T00:00:00Z"),
+        wakeupRequestId: "wake-1",
+        wakeupRequestStatus: "queued",
+        agentStatus: "idle",
+        staleThresholdMs: 5 * 60 * 1000,
+        now: new Date("2026-03-20T00:10:00Z"),
+      }),
+    ).toBe("issue_not_in_progress");
+  });
+
+  it("does not repair assigned queued work just because the issue is still todo", () => {
+    expect(
+      getIssueExecutionRepairReason({
+        issueStatus: "todo",
+        assigneeAgentId: "agent-1",
+        runId: "run-1",
+        runStatus: "queued",
+        runAgentId: "agent-1",
+        runCreatedAt: new Date("2026-03-20T00:00:00Z"),
+        runUpdatedAt: new Date("2026-03-20T00:00:00Z"),
+        wakeupRequestId: "wake-1",
+        wakeupRequestStatus: "queued",
+        agentStatus: "idle",
+        staleThresholdMs: 5 * 60 * 1000,
+        now: new Date("2026-03-20T00:10:00Z"),
+      }),
+    ).toBeNull();
+  });
+
+  it("repairs queued locks when the agent is no longer invokable after the stale threshold", () => {
+    expect(
+      getIssueExecutionRepairReason({
+        issueStatus: "in_progress",
+        assigneeAgentId: "agent-1",
+        runId: "run-1",
+        runStatus: "queued",
+        runAgentId: "agent-1",
+        runCreatedAt: new Date("2026-03-20T00:00:00Z"),
+        runUpdatedAt: new Date("2026-03-20T00:00:00Z"),
+        wakeupRequestId: "wake-1",
+        wakeupRequestStatus: "queued",
+        agentStatus: "paused",
+        staleThresholdMs: 5 * 60 * 1000,
+        now: new Date("2026-03-20T00:10:00Z"),
+      }),
+    ).toBe("queued_run_agent_unavailable");
+  });
+
+  it("does not repair healthy queued issue locks before the stale threshold", () => {
+    expect(
+      getIssueExecutionRepairReason({
+        issueStatus: "in_progress",
+        assigneeAgentId: "agent-1",
+        runId: "run-1",
+        runStatus: "queued",
+        runAgentId: "agent-1",
+        runCreatedAt: new Date("2026-03-20T00:00:00Z"),
+        runUpdatedAt: new Date("2026-03-20T00:03:00Z"),
+        wakeupRequestId: "wake-1",
+        wakeupRequestStatus: "queued",
+        agentStatus: "idle",
+        staleThresholdMs: 5 * 60 * 1000,
+        now: new Date("2026-03-20T00:06:00Z"),
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("shouldSkipIssueWakeupForStatus", () => {
+  it("skips issue wakeups for terminal issues", () => {
+    expect(
+      shouldSkipIssueWakeupForStatus({
+        issueStatus: "done",
+        reason: "issue_assigned",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not skip queued wakeups for todo issues", () => {
+    expect(
+      shouldSkipIssueWakeupForStatus({
+        issueStatus: "todo",
+        reason: "issue_assigned",
+      }),
+    ).toBe(false);
+  });
+
+  it("allows explicit reopen wakeups for terminal issues", () => {
+    expect(
+      shouldSkipIssueWakeupForStatus({
+        issueStatus: "done",
+        reason: "issue_reopened_via_comment",
+      }),
+    ).toBe(false);
   });
 });
